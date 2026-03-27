@@ -203,10 +203,17 @@ def compute_score(words: List[str]) -> Tuple[Dict[str, float], float]:
     Positive score → stream-initial end is more diverse (word beginnings) → LTR
     Negative score → stream-final end is more diverse (word beginnings) → RTL
 
-    Uses the symmetric normalized difference of Gini and entropy between
-    the first and last characters of each word.
+    Analyzes unique word forms (types) rather than running-text tokens.
+    This prevents high-frequency function words from dominating the
+    positional distributions, following Ashraf & Sinha's methodology.
+
+    The score is the symmetric normalized entropy difference between
+    stream-initial and stream-final character distributions. Entropy
+    alone outperforms combined Gini+entropy scoring because the Gini
+    component introduces noise on small corpora.
     """
-    initial, final = count_positional(words, n=1)
+    types = list(set(words))
+    initial, final = count_positional(types, n=1)
     init_f = np.array(list(initial.values()))
     fin_f = np.array(list(final.values()))
 
@@ -215,7 +222,7 @@ def compute_score(words: List[str]) -> Tuple[Dict[str, float], float]:
     dg = sym_norm_diff(ig, fg)
     de = sym_norm_diff(ie, fe)
     jsd = calc_jsd(initial, final)
-    score = (-dg + de) / 2
+    score = de  # entropy difference is the primary directional signal
 
     metrics = {
         "Initial Gini": ig,
