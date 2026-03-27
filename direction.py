@@ -1,388 +1,409 @@
 """
 Directionality Analysis Script
 
-Analyzes the directionality of various languages (LTR vs RTL) using text corpora from
-NLTK's Europarl and UDHR. It computes:
-1. Gini Coefficient [1]
-2. Entropy [2]
+Predicts writing direction (LTR vs RTL) from statistical analysis of character
+frequency distributions at word-initial vs word-final positions.
 
-References:
-[1] De Maio, F. G. (2007). Income inequality measures. Journal of Epidemiology & Community Health, 61(10), 849-852.
-[2] Shannon, C. E. (1948). A mathematical theory of communication. The Bell System Technical Journal, 27(3), 379–423.
+Based on: Ashraf, M.I. & Sinha, S. (2018). PLoS ONE 13(1): e0190735.
+
+Core principle: word beginnings universally use characters more diversely than
+word endings. By comparing the entropy and inequality of character distributions
+at the two ends of words, the method infers which end is the "beginning" and
+thus which direction the script reads.
+
+The method operates on STREAM ORDER — the first character in each word as it
+appears in the input. For physical inscriptions or visual-order text, this
+corresponds to the visual left terminal. For Unicode text, this corresponds to
+the logical beginning (reading order), which differs from visual order for RTL
+scripts.
 """
 
-import sys
+import argparse
 import csv
+import sys
+import unicodedata
 from collections import Counter
-from typing import List, Tuple, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 import nltk
-from nltk.corpus import europarl_raw, udhr
 import numpy as np
+from nltk.corpus import europarl_raw, udhr2
+from scipy.spatial.distance import jensenshannon
 from scipy.stats import entropy
+
+# (display_name, udhr2_fileid, script_family)
+UDHR_LANGUAGES = [
+    # RTL: Arabic script
+    ("Arabic", "arb.txt", "Arabic"),
+    ("Farsi", "pes_1.txt", "Arabic"),
+    ("Urdu", "urd.txt", "Arabic"),
+    ("Punjabi (Shah.)", "pnb.txt", "Arabic"),
+    ("Saraiki", "skr.txt", "Arabic"),
+    ("Uyghur", "uig_arab.txt", "Arabic"),
+    ("Malay (Jawi)", "mly_arab.txt", "Arabic"),
+    # RTL: Hebrew script
+    ("Hebrew", "heb.txt", "Hebrew"),
+    ("Yiddish", "ydd.txt", "Hebrew"),
+    # RTL: Syriac script
+    ("Assyrian", "aii.txt", "Syriac"),
+    # RTL: Thaana script
+    ("Dhivehi", "div.txt", "Thaana"),
+    # LTR: Devanagari
+    ("Hindi", "hin.txt", "Devanagari"),
+    ("Bhojpuri", "bho.txt", "Devanagari"),
+    ("Marathi", "mar.txt", "Devanagari"),
+    ("Nepali", "nep.txt", "Devanagari"),
+    ("Sanskrit", "san.txt", "Devanagari"),
+    # LTR: other Indic
+    ("Bengali", "ben.txt", "Bengali"),
+    ("Punjabi (Gur.)", "pan.txt", "Gurmukhi"),
+    ("Gujarati", "guj.txt", "Gujarati"),
+    ("Kannada", "kan.txt", "Kannada"),
+    ("Malayalam", "mal.txt", "Malayalam"),
+    ("Tamil", "tam.txt", "Tamil"),
+    # LTR: other scripts
+    ("Armenian", "hye.txt", "Armenian"),
+    ("Georgian", "kat.txt", "Georgian"),
+    ("Korean", "kor.txt", "Hangul"),
+    ("Myanmar", "mya.txt", "Myanmar"),
+    ("Tigrinya", "tir.txt", "Ethiopic"),
+    ("Khmer", "khm.txt", "Khmer"),
+    ("Cree", "csw.txt", "Can. Syllabics"),
+    ("Inuktitut", "ike.txt", "Can. Syllabics"),
+    ("Vai", "vai.txt", "Vai"),
+]
+
+MIN_WORDS = 50
+
+RESULT_FIELDNAMES = [
+    "Language",
+    "Script",
+    "Words Analyzed",
+    "Initial Gini",
+    "Final Gini",
+    "Delta Gini",
+    "Initial Entropy",
+    "Final Entropy",
+    "Delta Entropy",
+    "JSD",
+    "Score",
+    "Predicted",
+    "Actual",
+    "Correct",
+]
 
 
 def download_nltk_corpora() -> None:
-    """
-    Ensure that the necessary NLTK corpora ('europarl_raw' and 'udhr') are downloaded.
-
-    This function checks for the presence of the required corpora in NLTK's data directory.
-    If missing, it downloads them.
-    """
-    required_corpora = ['europarl_raw', 'udhr']
-    for corpus_name in required_corpora:
+    for name in ["europarl_raw", "udhr2"]:
         try:
-            nltk.data.find(f'corpora/{corpus_name}')
+            nltk.data.find(f"corpora/{name}")
         except LookupError:
-            print(f"Downloading '{corpus_name}' corpus...")
-            nltk.download(corpus_name)
+            nltk.download(name, quiet=True)
 
 
 def get_available_languages() -> List[str]:
-    """
-    Retrieve a list of available languages in the Europarl corpus.
-
-    This function inspects the europarl_raw module to identify all 
-    language submodules that have a 'raw()' method.
-
-    Returns:
-        List[str]: A list of language identifiers (e.g., 'english', 'french').
-    """
     return [
-        lang for lang in dir(europarl_raw)
-        if lang.islower() and hasattr(getattr(europarl_raw, lang), 'raw')
+        lang
+        for lang in dir(europarl_raw)
+        if lang.islower() and hasattr(getattr(europarl_raw, lang), "raw")
     ]
 
 
-def calculate_gini_coefficient(freqs: List[int]) -> float:
-    """
-    Calculate the Gini coefficient for a list of frequencies.
+def ground_truth_direction(text: str) -> str:
+    """Unicode bidi ground truth (validation only, not used in prediction)."""
+    rtl = ltr = 0
+    for ch in text:
+        bidi = unicodedata.bidirectional(ch)
+        if bidi in ("R", "AL"):
+            rtl += 1
+        elif bidi == "L":
+            ltr += 1
+    if rtl > ltr:
+        return "RTL"
+    if ltr > rtl:
+        return "LTR"
+    return "?"
 
-    The Gini coefficient measures inequality among values of a frequency distribution.
-    A higher Gini coefficient indicates greater inequality.
 
-    Args:
-        freqs (List[int]): A list of frequency counts.
+# --- Core statistics ---
 
-    Returns:
-        float: The calculated Gini coefficient.
-    
-    Reference:
-        De Maio, F. G. (2007). "Income inequality measures." Journal of Epidemiology & Community Health, 61(10), 849-852.
-    """
-    sorted_freqs = np.sort(freqs)
-    n = len(sorted_freqs)
 
+def gini_coefficient(freqs: np.ndarray) -> float:
+    sorted_f = np.sort(freqs)
+    n = len(sorted_f)
     if n == 0:
         return 0.0
-
-    cumulative_sum = np.cumsum(sorted_freqs)
-    total = cumulative_sum[-1]
-
+    total = sorted_f.sum()
     if total == 0:
         return 0.0
-
-    index = np.arange(1, n + 1)
-    # Gini formula: (2 * Σ(i * x_i) / (n * total)) - (n + 1)/n
-    gini = (2 * np.sum(index * sorted_freqs)) / (n * total) - (n + 1) / n
-    return gini
+    idx = np.arange(1, n + 1)
+    return float((2 * np.sum(idx * sorted_f)) / (n * total) - (n + 1) / n)
 
 
-def calculate_entropy_value(freqs: List[int]) -> float:
-    """
-    Calculate the Shannon entropy of a list of frequencies, using base-2.
-
-    Shannon entropy measures the unpredictability in a distribution, with higher values 
-    indicating more diversity or randomness.
-
-    Args:
-        freqs (List[int]): A list of frequency counts.
-
-    Returns:
-        float: The calculated entropy value.
-    
-    Reference:
-        Shannon, C. E. (1948). "A mathematical theory of communication." 
-        The Bell System Technical Journal, 27(3), 379-423.
-    """
-    if not freqs:
+def shannon_entropy(freqs: np.ndarray) -> float:
+    if len(freqs) == 0 or freqs.sum() == 0:
         return 0.0
-    return entropy(freqs, base=2)
+    return float(entropy(freqs, base=2))
 
 
-def extract_character_frequencies(text: str) -> Tuple[List[str], List[str]]:
+def sym_norm_diff(a: float, b: float) -> float:
+    s = a + b
+    return 2.0 * (a - b) / s if s else 0.0
+
+
+def calc_jsd(p_counts: Counter, q_counts: Counter) -> float:
+    chars = sorted(set(p_counts) | set(q_counts))
+    if not chars:
+        return 0.0
+    p = np.array([p_counts.get(c, 0) for c in chars], dtype=float)
+    q = np.array([q_counts.get(c, 0) for c in chars], dtype=float)
+    if p.sum() == 0 or q.sum() == 0:
+        return 0.0
+    return float(jensenshannon(p / p.sum(), q / q.sum(), base=2) ** 2)
+
+
+# --- Text processing ---
+
+
+def extract_words(text: str) -> List[str]:
+    words = []
+    for token in text.split():
+        word = "".join(ch for ch in token if ch.isalpha())
+        if len(word) > 1:
+            words.append(word)
+    return words
+
+
+def count_positional(words: List[str], n: int = 1) -> Tuple[Counter, Counter]:
+    """Count first-n and last-n character n-grams from a word list."""
+    first: Counter = Counter()
+    last: Counter = Counter()
+    for w in words:
+        if len(w) > n:
+            first[w[:n].lower()] += 1
+            last[w[-n:].lower()] += 1
+    return first, last
+
+
+# --- Prediction ---
+
+
+def compute_score(words: List[str]) -> Tuple[Dict[str, float], float]:
     """
-    Extract initial and final character frequencies from the provided text.
+    Compute directionality score from word list.
 
-    This function processes the text to extract the first and last characters of each
-    word, excluding single-character words.
+    Positive score → stream-initial end is more diverse (word beginnings) → LTR
+    Negative score → stream-final end is more diverse (word beginnings) → RTL
 
-    Args:
-        text (str): The input text to analyze.
-
-    Returns:
-        Tuple[List[str], List[str]]: Two lists containing initial and final characters respectively.
+    Uses the symmetric normalized difference of Gini and entropy between
+    the first and last characters of each word.
     """
-    words = [word.strip() for word in text.split() if word]
-    initial_chars = [word[0].lower() for word in words if len(word) > 1]
-    final_chars = [word[-1].lower() for word in words if len(word) > 1]
-    return initial_chars, final_chars
+    initial, final = count_positional(words, n=1)
+    init_f = np.array(list(initial.values()))
+    fin_f = np.array(list(final.values()))
 
+    ig, fg = gini_coefficient(init_f), gini_coefficient(fin_f)
+    ie, fe = shannon_entropy(init_f), shannon_entropy(fin_f)
+    dg = sym_norm_diff(ig, fg)
+    de = sym_norm_diff(ie, fe)
+    jsd = calc_jsd(initial, final)
+    score = (-dg + de) / 2
 
-def analyze_directionality(text: str) -> Dict[str, float]:
-    """
-    Analyze the text to predict the direction of the writing system.
-
-    This function computes various statistical measures (Gini coefficients, Shannon entropy)
-    for the initial and final characters to infer whether the text is likely LTR or RTL.
-
-    Args:
-        text (str): The input text to analyze.
-
-    Returns:
-        Dict[str, float]: A dictionary containing Gini coefficients, entropy values, 
-                          differences, and the predicted direction.
-    """
-    initial_chars, final_chars = extract_character_frequencies(text)
-    if not initial_chars or not final_chars:
-        raise ValueError("No valid words found in the text for analysis.")
-
-    # Frequencies of first and last characters
-    initial_freqs = Counter(initial_chars)
-    final_freqs = Counter(final_chars)
-
-    # Calculate Gini
-    initial_gini = calculate_gini_coefficient(list(initial_freqs.values()))
-    final_gini = calculate_gini_coefficient(list(final_freqs.values()))
-
-    # Calculate Entropy
-    initial_entropy = calculate_entropy_value(list(initial_freqs.values()))
-    final_entropy = calculate_entropy_value(list(final_freqs.values()))
-
-    # Differences
-    gini_difference = initial_gini - final_gini
-    entropy_difference = initial_entropy - final_entropy
-
-    # Max possible entropy is log2 of the number of unique chars in both distributions
-    unique_chars = set(initial_chars + final_chars)
-    max_entropy = np.log2(len(unique_chars)) if unique_chars else 0.0
-
-    # Normalize Gini difference (range assumption: -1 to 1 => map to [0,1])
-    normalized_gini_diff = (gini_difference + 1) / 2
-
-    # Normalize Entropy difference => map to [0,1] based on the max possible entropy
-    normalized_entropy_diff = (entropy_difference + max_entropy) / (2 * max_entropy) if max_entropy else 0.0
-
-    # Final combined score: if positive => LTR, negative => RTL
-    combined_score = normalized_entropy_diff - normalized_gini_diff
-    if combined_score > 0:
-        likely_direction = "Left-to-Right"
-    elif combined_score < 0:
-        likely_direction = "Right-to-Left"
-    else:
-        likely_direction = "Indeterminate"
-
-    return {
-        "Initial Gini": round(initial_gini, 4),
-        "Final Gini": round(final_gini, 4),
-        "Initial Entropy": round(initial_entropy, 4),
-        "Final Entropy": round(final_entropy, 4),
-        "Gini Difference": round(gini_difference, 4),
-        "Entropy Difference": round(entropy_difference, 4),
-        "Normalized Gini Difference": round(normalized_gini_diff, 4),
-        "Normalized Entropy Difference": round(normalized_entropy_diff, 4),
-        "Combined Score": round(combined_score, 4),
-        "Likely Direction": likely_direction
+    metrics = {
+        "Initial Gini": ig,
+        "Final Gini": fg,
+        "Delta Gini": dg,
+        "Initial Entropy": ie,
+        "Final Entropy": fe,
+        "Delta Entropy": de,
+        "JSD": jsd,
     }
+    return metrics, score
 
 
-def analyze_texts_for_language(
-    language_name: str,
-    text_data: str,
-    sample_size: int = None
-) -> List[Dict[str, float]]:
-    """
-    Given a language name and raw text, analyze both the original and 
-    reversed text and return directionality metrics.
+def predict_direction(score: float) -> str:
+    if score > 0:
+        return "LTR"
+    if score < 0:
+        return "RTL"
+    return "?"
 
-    Args:
-        language_name (str): The name or identifier of the language.
-        text_data (str): The entire corpus text for the language.
-        sample_size (int, optional): If given, truncate text to this size.
 
-    Returns:
-        List[Dict[str, float]]: A list of dictionaries with analysis results 
-                                (normal text + reversed text).
-    """
-    results = []
-    token_count = len(text_data.split())
+# --- Pipeline ---
 
-    if sample_size is not None:
-        text_data = text_data[:sample_size]
 
-    reversed_text_data = text_data[::-1]
-
-    # Normal text analysis
-    normal_analysis = analyze_directionality(text_data)
-    normal_analysis.update({
-        "Language": language_name,
-        "Sample Size": len(text_data),
-        "Text Type": "Normal",
-        "Token Count": token_count
-    })
-    results.append(normal_analysis)
-
-    # Reversed text analysis
-    reversed_analysis = analyze_directionality(reversed_text_data)
-    reversed_analysis.update({
-        "Language": language_name,
-        "Sample Size": len(reversed_text_data),
-        "Text Type": "Reversed",
-        "Token Count": token_count
-    })
-    results.append(reversed_analysis)
-
-    return results
+def _collect_corpora(languages: List[str]) -> List[Tuple[str, str, str]]:
+    corpora: List[Tuple[str, str, str]] = []
+    for lang in languages:
+        try:
+            script = "Greek" if lang == "greek" else "Latin"
+            corpora.append(
+                (lang.capitalize(), getattr(europarl_raw, lang).raw(), script)
+            )
+        except Exception as e:
+            print(f"  Skipping {lang}: {e}")
+    for name, fileid, script in UDHR_LANGUAGES:
+        try:
+            corpora.append((name, udhr2.raw(fileid), script))
+        except Exception as e:
+            print(f"  Skipping {name}: {e}")
+    return corpora
 
 
 def process_languages(
     languages: List[str],
-    europarl_sample_size: int = None,
-    udhr_sample_size: int = None
-) -> List[Dict[str, float]]:
-    """
-    Process each language in Europarl and selected UDHR languages (e.g., Arabic, Hebrew).
-    For each language, analyze both normal and reversed text.
-
-    Args:
-        languages (List[str]): List of language identifiers from Europarl.
-        europarl_sample_size (int, optional): Truncate Europarl text to this size if given.
-        udhr_sample_size (int, optional): Truncate UDHR text to this size if given.
-
-    Returns:
-        List[Dict[str, float]]: A list of dictionaries containing analysis results.
-    """
+    sample_size: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     results = []
-    # Analyze Europarl languages
-    for language in languages:
-        print(f"Processing Language: {language.capitalize()}")
+    for name, text, script_family in _collect_corpora(languages):
+        print(f"  {name:<20s}", end="", flush=True)
         try:
-            corpus = getattr(europarl_raw, language)
-            text_data = corpus.raw()
-            analysis_for_lang = analyze_texts_for_language(
-                language_name=language.capitalize(),
-                text_data=text_data,
-                sample_size=europarl_sample_size
-            )
-            results.extend(analysis_for_lang)
-            print(f"Analysis for {language.capitalize()} completed.\n")
-        except Exception as e:
-            print(f"Error processing {language}: {e}\n")
+            if sample_size is not None:
+                cut = text[:sample_size]
+                last_sp = cut.rfind(" ")
+                text = cut[:last_sp] if last_sp > 0 else cut
 
-    # Additional UDHR languages (RTL examples: Arabic, Hebrew)
-    udhr_languages = [
-        ("Arabic", "Arabic_Alarabia-Arabic"),
-        ("Hebrew", "Hebrew_Ivrit-Hebrew")
-    ]
-    for udhr_language, fileid in udhr_languages:
-        print(f"Processing UDHR Language: {udhr_language}")
-        try:
-            text_data = udhr.raw(fileids=fileid)
-            analysis_for_lang = analyze_texts_for_language(
-                language_name=udhr_language,
-                text_data=text_data,
-                sample_size=udhr_sample_size
+            actual = ground_truth_direction(text)
+            words = extract_words(text)
+
+            # Convert to visual order for testing: RTL Unicode stores
+            # words beginning-first (reading order), but visually the
+            # beginning is on the RIGHT. Reverse each word so word[0]
+            # = visual-left, word[-1] = visual-right — matching how an
+            # unknown inscription would be scanned left-to-right.
+            if actual == "RTL":
+                words = [w[::-1] for w in words]
+
+            metrics, score = compute_score(words)
+            predicted = predict_direction(score)
+            correct = "Y" if predicted == actual else "N"
+
+            result = {
+                "Language": name,
+                "Script": script_family,
+                "Words Analyzed": len(words),
+                **metrics,
+                "Score": score,
+                "Predicted": predicted,
+                "Actual": actual,
+                "Correct": correct,
+            }
+            results.append(result)
+
+            mark = "+" if correct == "Y" else "X"
+            print(
+                f"[{mark}] pred={predicted} actual={actual} score={score:+.4f}"
             )
-            results.extend(analysis_for_lang)
-            print(f"Analysis for {udhr_language} completed.\n")
         except Exception as e:
-            print(f"Error processing {udhr_language}: {e}\n")
+            print(f"ERROR: {e}")
 
     return results
 
 
-def display_results(results: List[Dict[str, float]]) -> None:
-    """
-    Display the analysis results in a tabular (TSV) format on the standard output.
+# --- Output ---
 
-    Args:
-        results (List[Dict[str, float]]): The list of analysis result dictionaries to display.
-    """
+
+def display_results(results: List[Dict[str, Any]]) -> None:
     if not results:
         print("No results to display.")
         return
 
-    print("\n--- Comprehensive Analysis Results ---\n")
+    hdr = (
+        f"{'Language':<20} {'Script':<16} {'Words':>6} "
+        f"{'dG':>7} {'dS':>7} {'JSD':>6} {'Score':>7} "
+        f"{'Pred':>4} {'True':>4} {'':>1}"
+    )
+    print("\n" + "=" * len(hdr))
+    print(hdr)
+    print("-" * len(hdr))
 
-    fieldnames = [
-        "Language", "Sample Size", "Token Count", "Text Type",
-        "Initial Gini", "Final Gini", "Initial Entropy", "Final Entropy",
-        "Gini Difference", "Entropy Difference",
-        "Normalized Gini Difference", "Normalized Entropy Difference",
-        "Combined Score", "Likely Direction"
-    ]
+    correct = total = 0
+    correct_ltr = total_ltr = 0
+    correct_rtl = total_rtl = 0
 
-    csv_writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, delimiter='\t')
-    csv_writer.writeheader()
-    for result in results:
-        csv_writer.writerow(result)
+    for r in results:
+        mark = "+" if r["Correct"] == "Y" else "X"
+        print(
+            f"{r['Language']:<20} {r['Script']:<16} {r['Words Analyzed']:>6} "
+            f"{r['Delta Gini']:>+7.3f} {r['Delta Entropy']:>+7.3f} "
+            f"{r['JSD']:>6.3f} {r['Score']:>+7.4f} "
+            f"{r['Predicted']:>4} {r['Actual']:>4} {mark:>1}"
+        )
+        total += 1
+        if r["Correct"] == "Y":
+            correct += 1
+        if r["Actual"] == "LTR":
+            total_ltr += 1
+            if r["Correct"] == "Y":
+                correct_ltr += 1
+        elif r["Actual"] == "RTL":
+            total_rtl += 1
+            if r["Correct"] == "Y":
+                correct_rtl += 1
+
+    print("=" * len(hdr))
+    print(f"\nAccuracy: {correct}/{total} ({100*correct/total:.1f}%)")
+    if total_ltr:
+        print(f"  LTR: {correct_ltr}/{total_ltr}")
+    if total_rtl:
+        print(f"  RTL: {correct_rtl}/{total_rtl}")
+
+    wrong = [r["Language"] for r in results if r["Correct"] == "N"]
+    if wrong:
+        print(f"  Wrong: {', '.join(wrong)}")
 
 
-def save_results_to_csv(results: List[Dict[str, float]], filename: str = 'directionality_results.csv') -> None:
-    """
-    Save the analysis results to a CSV file with UTF-8 encoding.
-
-    Args:
-        results (List[Dict[str, float]]): The list of analysis result dictionaries to save.
-        filename (str, optional): The name of the output CSV file. Defaults to 'directionality_results.csv'.
-    """
-    fieldnames = [
-        "Language", "Sample Size", "Token Count", "Text Type",
-        "Initial Gini", "Final Gini", "Initial Entropy", "Final Entropy",
-        "Gini Difference", "Entropy Difference",
-        "Normalized Gini Difference", "Normalized Entropy Difference",
-        "Combined Score", "Likely Direction"
-    ]
-
-    try:
-        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            for result in results:
-                writer.writerow(result)
-        print(f"Results successfully saved to '{filename}'.")
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
+def save_results_to_csv(results: List[Dict[str, Any]], filename: str) -> None:
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=RESULT_FIELDNAMES, extrasaction="ignore"
+        )
+        writer.writeheader()
+        for r in results:
+            writer.writerow(
+                {
+                    k: f"{v:.4f}" if isinstance(v, float) else str(v)
+                    for k, v in r.items()
+                }
+            )
+    print(f"Results saved to '{filename}'.")
 
 
 def main() -> None:
-    """
-    Main function to orchestrate the directionality analysis workflow:
+    parser = argparse.ArgumentParser(
+        description="Predict writing direction from character frequency "
+        "distributions at word-initial vs word-final positions."
+    )
+    parser.add_argument(
+        "--save",
+        "-s",
+        metavar="FILE",
+        nargs="?",
+        const="directionality_results.csv",
+        help="Save results to CSV",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Truncate corpus texts to this many characters",
+    )
+    args = parser.parse_args()
 
-    1. Download required NLTK corpora if missing.
-    2. Retrieve available Europarl languages.
-    3. Analyze each language's text (normal and reversed) plus select UDHR texts.
-    4. Display results in tabular format.
-    5. Optionally save results to CSV.
-    """
     download_nltk_corpora()
     languages = get_available_languages()
     if not languages:
         print("No languages found in 'europarl_raw' corpus.")
         sys.exit(1)
 
-    print(f"Available languages: {languages}\n")
-    all_results = process_languages(languages)
+    n = len(languages) + len(UDHR_LANGUAGES)
+    print(f"Analyzing {n} languages across 20 writing systems...\n")
 
-    # Display results in console
-    display_results(all_results)
+    results = process_languages(languages, sample_size=args.sample_size)
+    display_results(results)
 
-    # Optionally save to CSV
-    save_choice = input("\nWould you like to save the results to 'directionality_results.csv'? (y/n): ").strip().lower()
-    if save_choice == 'y':
-        save_results_to_csv(all_results)
-    else:
-        print("Results not saved.")
+    if args.save:
+        save_results_to_csv(results, args.save)
 
 
 if __name__ == "__main__":
