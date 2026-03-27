@@ -73,8 +73,6 @@ UDHR_LANGUAGES = [
     ("Vai", "vai.txt", "Vai"),
 ]
 
-MIN_WORDS = 50
-
 RESULT_FIELDNAMES = [
     "Language",
     "Script",
@@ -165,9 +163,19 @@ def calc_jsd(p_counts: Counter, q_counts: Counter) -> float:
 # --- Text processing ---
 
 
-def extract_words(text: str) -> List[str]:
+def extract_words(text: str, delimiter: Optional[str] = None) -> List[str]:
+    """
+    Extract words from text. Each word is stripped of non-alphabetic
+    characters (for handling punctuation in corpus text). Words with
+    fewer than 2 characters are excluded since they contribute the
+    same symbol to both positions.
+
+    The delimiter parameter controls word boundary detection: None
+    splits on whitespace (default for most corpora), or pass a
+    specific string for other delimiters.
+    """
     words = []
-    for token in text.split():
+    for token in text.split(delimiter):
         word = "".join(ch for ch in token if ch.isalpha())
         if len(word) > 1:
             words.append(word)
@@ -180,8 +188,8 @@ def count_positional(words: List[str], n: int = 1) -> Tuple[Counter, Counter]:
     last: Counter = Counter()
     for w in words:
         if len(w) > n:
-            first[w[:n].lower()] += 1
-            last[w[-n:].lower()] += 1
+            first[w[:n]] += 1
+            last[w[-n:]] += 1
     return first, last
 
 
